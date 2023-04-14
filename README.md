@@ -71,7 +71,7 @@ target/release/problem1
 
 ### Summary
 
-Why rust linked-list?
+TODO
 
 <!--
 Problem 2: Atmospheric Temperature Reading Module (50 points)

@@ -1,132 +1,97 @@
 use rand::prelude::*;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicPtr, AtomicUsize};
+use std::sync::atomic::AtomicUsize;
 use std::sync::{atomic::Ordering, Arc, Mutex};
 use std::thread;
 use std::thread::JoinHandle;
-use std::ptr;
 
 const NUM_OF_SERVENTS: i32 = 4;
 const NUM_OF_GUESTS: i32 = 500000;
 
 struct Node {
     tag: i32,
-    next: AtomicPtr<Mutex<Node>>,
+    next: Option<Arc<Mutex<Node>>>,
 }
 
 impl Node {
     fn new(v: i32) -> Self {
         Node {
             tag: v,
-            next: AtomicPtr::default(),
+            next: None
         }
     }
 }
 
 struct Chain {
-    head: AtomicPtr<Mutex<Node>>,
+    head: Option<Arc<Mutex<Node>>>,
 }
 
 impl Default for Chain {
     fn default() -> Self {
         Chain {
-            head: AtomicPtr::default(),
+            head: None,
         }
     }
 }
 
 impl Chain {
-    pub fn insert(&self, v: i32) {
-        let mut prev_ptr: *mut Mutex<Node> = ptr::null_mut();
-        let mut cur_ptr = self.head.load(Ordering::SeqCst);
-        while !cur_ptr.is_null() {
-            let cur_ref = unsafe { cur_ptr.as_ref().unwrap() }.lock().unwrap();
-            // If v < the current ref tag, then we place v before the current ref
-            if v < cur_ref.tag {
-                let new_v = Node::new(v);
-                new_v.next.store(cur_ptr, Ordering::SeqCst);
+    pub fn insert(&mut self, v: i32) {
+        let new_v = Arc::new(Mutex::new(Node::new(v)));
 
-                if prev_ptr.is_null() { // v becomes new head
-                    self.head.store(&mut Mutex::new(new_v), Ordering::SeqCst);
-                    return;
+        if let None = self.head {
+            self.head = Some(new_v.clone());
+            return;
+        }
+
+        let mut prev: Option<Arc<Mutex<Node>>> = None;
+        let mut cur = self.head.clone();
+
+        while let Some(node) = cur {
+            let cur_guard = node.lock().unwrap();
+
+            if v < cur_guard.tag {
+                if let Some(p) = prev {
+                    let mut p_guard = p.lock().unwrap();
+                    p_guard.next = Some(new_v.clone());
+                } else {
+                    self.head = Some(new_v.clone());
                 }
-                let prev_ref = unsafe { prev_ptr.as_ref().unwrap() }.lock().unwrap();
-                prev_ref.next.store(&mut Mutex::new(new_v), Ordering::SeqCst);
+
+                new_v.lock().unwrap().next = Some(node.clone());
+                return;
             }
-            // If not, set cur_ptr to the next in the linked list
-            prev_ptr = cur_ptr;
-            cur_ptr = cur_ref.next.load(Ordering::SeqCst);
+
+            prev = Some(node.clone());
+            cur = cur_guard.next.clone();
         }
-        if cur_ptr.is_null() {
-            let new_v = Node::new(v);
-            self.head.store(&mut Mutex::new(new_v), Ordering::SeqCst);
-        }
+
+        prev.unwrap().lock().unwrap().next = Some(new_v);
     }
 
-    pub fn contains(&self, v: i32) -> bool {
-        let mut cur_ptr = self.head.load(Ordering::SeqCst);
-        while !cur_ptr.is_null() {
-            let cur_ref = unsafe { cur_ptr.as_ref().unwrap() }.lock().unwrap();
-            // If the current ref tag is what we're looking for, return true
-            if cur_ref.tag == v {
+    pub fn contains(&self, v: &i32) -> bool {
+        let mut cur = self.head.clone();
+
+        while let Some(node) = cur {
+            let n_guard = node.lock().unwrap();
+
+            if &n_guard.tag == v {
                 return true
             }
-            // If not, set cur_ptr to the next in the linked list
-            cur_ptr = cur_ref.next.load(Ordering::SeqCst);
+
+            cur = n_guard.next.clone();
         }
+
         return false
     }
 
     /// Pops node from top of the chain 
-    pub fn pop(&self) -> Option<i32> {
-        let mut head_ptr = self.head.load(Ordering::SeqCst);
-        if !head_ptr.is_null() {
-            let head_ref = unsafe { head_ptr.as_ref().unwrap() }.lock().unwrap();
-            let tag = head_ref.tag;
-
-            assert!(tag > 0, "Tag should not be negative! {}", tag);
-            assert!(tag < NUM_OF_GUESTS, "Tag cannot be bigger than num of guests {}", tag);
-
-            // Get the Current Head's next node, which will be the new head node
-            let next_ptr = head_ref.next.load(Ordering::SeqCst);
-            if !next_ptr.is_null() {
-
-                // Set head to the next head
-                loop {
-                    // Deal with if the head has changed since we started.
-                    match self.head.compare_exchange(head_ptr, next_ptr, Ordering::SeqCst, Ordering::SeqCst) {
-                        Ok(_) => { break; },
-                        Err(p) => {
-                            let old_head_ptr = head_ptr;
-                            head_ptr = p;
-                            if !head_ptr.is_null() {
-                                let phead_ref = unsafe { head_ptr.as_ref().unwrap() }.lock().unwrap();
-
-                                // phead_ref.next might be != to the old head so bugs might be here
-                                //phead_ref.next.store(next_ptr, Ordering::SeqCst);
-                                match phead_ref.next.compare_exchange(old_head_ptr, next_ptr, Ordering::SeqCst, Ordering::SeqCst) {
-                                    Ok(_) => {},
-                                    Err(j) => {
-                                        if j.is_null() {
-                                            panic!("phead_ref.next is not old_head and is null!");
-                                        } else {
-                                            panic!("phead_ref.next is not old_head nor is it null!");
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    };
-                }
-            } else {
-                self.head.store(ptr::null_mut(), Ordering::SeqCst);
-            }
-
-            // Drop the old head pointer
-            drop(head_ptr);
-
-            Some(tag)
-        } else { None }
+    pub fn pop(&mut self) -> Option<i32> {
+        self.head.take().map(|head| {
+            let head = head.lock().unwrap();
+            let next = head.next.clone();
+            self.head = next;
+            head.tag
+        })
     }
 }
 
@@ -172,13 +137,14 @@ fn main() {
         let servent = thread::spawn(move || {
             let mut action = ServentAction::AddPresent;
 
-            let should_find_tag: bool = false;//rand::random();
+            // There is a 25% chance that the Minotaur will ask for a servent to find a tag.
+            let should_find_tag: bool = rand::thread_rng().gen_ratio(1,4);
 
             loop {
-                if should_find_tag {
+                if should_find_tag && chain.lock().unwrap().head.is_some() {
                     // Minotaur wants a random tag found.
                     let to_find = rand::thread_rng().gen_range(0..NUM_OF_GUESTS);
-                    if chain.lock().unwrap().contains(to_find) {
+                    if chain.lock().unwrap().contains(&to_find) {
                         println!("Minotaur asked servent {} to find present {}...The present was found.", i, to_find);
                     } else {
                         println!("Minotaur asked servent {} to find present {}...The present was not found.", i, to_find);
@@ -194,7 +160,7 @@ fn main() {
                             chain.lock().unwrap().insert(t);
                             println!("Servent {} added gift {} to the chain.", i, t);
                         } else {
-                            if chain.lock().unwrap().head.load(Ordering::SeqCst).is_null() {
+                            if let None = chain.lock().unwrap().head {
                                 println!("Servent {} is finished!", i);
                                 break;
                             }
